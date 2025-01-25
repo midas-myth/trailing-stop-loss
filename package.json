@@ -1,0 +1,20 @@
+{
+  "name": "trailing-stop-loss",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "scripts": {
+    "start": "tsx main.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  },
+  "dependencies": {
+    "@gmx-io/sdk": "^0.1.2",
+    "dotenv": "^16.4.7",
+    "viem": "2.7.20"
+  }
+}
