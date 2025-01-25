@@ -17,6 +17,7 @@ import { USD_DECIMALS } from "@gmx-io/sdk/configs/factors.js";
 import { MarketsInfoData } from "@gmx-io/sdk/types/markets.js";
 import {
   DecreasePositionSwapType,
+  OrderInfo,
   OrderType,
 } from "@gmx-io/sdk/types/orders.js";
 import { Position } from "@gmx-io/sdk/types/positions.js";
@@ -27,6 +28,7 @@ import {
   convertToUsd,
   getIsEquivalentTokens,
 } from "@gmx-io/sdk/utils/tokens.js";
+import { sleep } from "@gmx-io/sdk/utils/common.js";
 
 dotenv.config();
 
@@ -38,6 +40,12 @@ if (!process.env.PRIVATE_KEY) {
 
 const account = privateKeyToAccount(process.env.PRIVATE_KEY! as any);
 
+// const STOP_LOSS_RECREATION_INTERVAL_MS = 1000 * 60 * 2; // 2 minutes
+const STOP_LOSS_RECREATION_INTERVAL_MS = 1000 * 30; // 30 seconds
+const STOP_LOSS_OFFSET_BPS = 1000n; // 10%
+const STOP_LOSS_THRESHOLD_DIFFERENCE_BPS = 100n; // 1%
+const FULL_BPS = 10000n; // 100%
+
 const walletClient = createWalletClient({
   transport: http(undefined, {
     timeout: 60000,
@@ -45,6 +53,8 @@ const walletClient = createWalletClient({
       wait: 200,
       batchSize: 1000,
     },
+    retryDelay: 1000,
+    retryCount: 3,
   }),
   account: account,
   chain: avalancheFuji,
@@ -94,16 +104,19 @@ async function createNewStopLossOrder({
   if (!marketInfo || !tokensData) return;
 
   const price = getMarkPrice({
-    prices: marketInfo.longToken.prices,
+    prices: marketInfo.indexToken.prices,
     isIncrease: false,
     isLong: position.isLong,
   });
 
   const stopLossPrice = position.isLong
-    ? bigMath.mulDiv(price, 90n, 100n)
-    : bigMath.mulDiv(price, 110n, 100n);
+    ? bigMath.mulDiv(price, FULL_BPS - STOP_LOSS_OFFSET_BPS, FULL_BPS)
+    : bigMath.mulDiv(price, FULL_BPS + STOP_LOSS_OFFSET_BPS, FULL_BPS);
 
-  console.log(formatUnits(stopLossPrice, USD_DECIMALS));
+  console.log(
+    "Creating new stop loss order at",
+    formatUnits(stopLossPrice, USD_DECIMALS)
+  );
 
   const collateralPrice = getIsEquivalentTokens(
     marketInfo.indexToken,
@@ -138,7 +151,10 @@ async function createNewStopLossOrder({
   // tokensData: TokensData;
   // autoCancel: boolean;
 
-  const stopLossOrder = await sdk.orders.createDecreaseOrder({
+  // const stopLossOrder = await
+
+  console.log("Creating stop loss order. Creating...");
+  await sdk.orders.createDecreaseOrder({
     allowedSlippage: 50,
     collateralToken: tokensData[position.collateralTokenAddress],
     marketInfo,
@@ -180,6 +196,154 @@ async function createNewStopLossOrder({
     isLong: position.isLong,
     tokensData,
   });
+
+  console.log("Stop loss order created. Created.");
+}
+
+async function recreateOrSkipExistingStopLoss({
+  sdk,
+  marketsInfoData,
+  tokensData,
+  order,
+  position,
+}: {
+  sdk: GmxSdk;
+  marketsInfoData: MarketsInfoData;
+  tokensData: TokensData;
+  order: OrderInfo;
+  position: Position;
+}) {
+  const updatedAtMs = Number(order.updatedAtTime) * 1000;
+  const nowMs = Date.now();
+
+  // if it was updated in the recreation interval, don't edit it
+  if (nowMs - updatedAtMs < STOP_LOSS_RECREATION_INTERVAL_MS) {
+    console.log(
+      "Existing stop loss is too recent. It was updated ~",
+      Math.round((nowMs - updatedAtMs) / 1000 / 60),
+      "minutes ago. Skipping..."
+    );
+    return;
+  }
+
+  // if the trigger price is withing 5% of current nessessasry pricee (10% less than market for long, 10% more than market for short)
+  // don't edit it
+
+  const indexTokenDecimals =
+    marketsInfoData[order.marketAddress].indexToken.decimals;
+  const existingTriggerPrice =
+    order.contractTriggerPrice * 10n ** BigInt(indexTokenDecimals);
+  console.log(
+    "Existing trigger price",
+    formatUnits(existingTriggerPrice, USD_DECIMALS)
+  );
+
+  const currentPrice = getMarkPrice({
+    prices: marketsInfoData[order.marketAddress].indexToken.prices,
+    isIncrease: false,
+    isLong: order.isLong,
+  });
+
+  const necessaryTriggerPrice = order.isLong
+    ? bigMath.mulDiv(currentPrice, FULL_BPS - STOP_LOSS_OFFSET_BPS, FULL_BPS)
+    : bigMath.mulDiv(currentPrice, FULL_BPS + STOP_LOSS_OFFSET_BPS, FULL_BPS);
+
+  console.log(
+    "Necessary trigger price",
+    formatUnits(necessaryTriggerPrice, USD_DECIMALS)
+  );
+
+  // for long if nessesssary triggr price is lower then existing trigger price, skip
+  // for short if nessesssary triggr price is higher then existing trigger price, skip
+  if (order.isLong && necessaryTriggerPrice < existingTriggerPrice) {
+    console.log(
+      "Price has lowered. Dont update the long stop loss. Skipping..."
+    );
+    return;
+  } else if (!order.isLong && necessaryTriggerPrice > existingTriggerPrice) {
+    console.log(
+      "Price has risen. Dont update the short stop loss. Skipping..."
+    );
+    return;
+  }
+
+  if (
+    bigMath.abs(existingTriggerPrice - necessaryTriggerPrice) <
+    bigMath.mulDiv(currentPrice, STOP_LOSS_THRESHOLD_DIFFERENCE_BPS, 100_00n)
+  ) {
+    console.log(
+      "Trigger price is within 1% of necessary trigger price. Skipping..."
+    );
+    return;
+  }
+
+  const existingOrderKey = order.key;
+
+  // cancel the existing order
+
+  console.log("Cancelling existing stop loss order. Cancelling...");
+  await sdk.orders.cancelOrders([existingOrderKey]);
+
+  await createNewStopLossOrder({
+    sdk,
+    marketsInfoData,
+    tokensData,
+    position,
+  });
+}
+
+async function loopRecreateOrSkipExistingStopLoss({
+  position,
+}: {
+  position: Position;
+}) {
+  while (true) {
+    const { marketsInfoData, tokensData, pricesUpdatedAt } =
+      await sdk.markets.getMarketsInfo();
+
+    if (!marketsInfoData || !tokensData) {
+      await sleep(STOP_LOSS_RECREATION_INTERVAL_MS);
+      return;
+    }
+
+    // check if position is still open
+
+    const positions = await sdk.positions.getPositions({
+      marketsInfoData,
+      tokensData,
+    });
+
+    if (!positions.positionsData?.[position.key]) {
+      console.log("Position is closed. Stopping...");
+      process.exit(0);
+      return;
+    }
+
+    const ordersResult = await sdk.orders.getOrders({
+      marketsInfoData,
+      tokensData,
+      marketsDirectionsFilter: [
+        {
+          direction: position.isLong ? "long" : "short",
+          marketAddress: position.marketAddress as Address,
+          collateralAddress: position.collateralTokenAddress as Address,
+        },
+      ],
+      orderTypesFilter: [OrderType.StopLossDecrease],
+    });
+
+    const firstOrder = Object.values(ordersResult.ordersInfoData)[0];
+
+    await recreateOrSkipExistingStopLoss({
+      sdk,
+      marketsInfoData,
+      tokensData,
+      order: firstOrder,
+      position,
+    });
+
+    await sleep(STOP_LOSS_RECREATION_INTERVAL_MS);
+  }
 }
 
 async function main() {
@@ -203,7 +367,7 @@ async function main() {
     const collateralTokenName =
       tokensData?.[position.collateralTokenAddress].name;
     const price = getMarkPrice({
-      prices: marketInfo.longToken.prices,
+      prices: marketInfo.indexToken.prices,
       isIncrease: false,
       isLong: position.isLong,
     });
@@ -257,69 +421,16 @@ async function main() {
 
     const firstOrder = Object.values(ordersResult.ordersInfoData)[0];
 
-    const updatedAtMs = Number(firstOrder.updatedAtTime) * 1000;
-    const nowMs = Date.now();
-
-    // if it was updated in the last 2 minutes, don't edit it
-    if (nowMs - updatedAtMs < 2 * 60 * 1000) {
-      console.log(
-        "Existing stop loss is too recent. It was updated ~",
-        Math.round((nowMs - updatedAtMs) / 1000 / 60),
-        "minutes ago. Skipping..."
-      );
-      return;
-    }
-
-    // if the trigger price is withing 5% of current nessessasry pricee (10% less than market for long, 10% more than market for short)
-    // don't edit it
-
-    const indexTokenDecimals =
-      marketsInfoData[selectedPosition.marketAddress].indexToken.decimals;
-    const existingTriggerPrice =
-      firstOrder.contractTriggerPrice * 10n ** BigInt(indexTokenDecimals);
-    console.log(
-      "Existing trigger price",
-      formatUnits(existingTriggerPrice, USD_DECIMALS)
-    );
-
-    const currentPrice = getMarkPrice({
-      prices: marketsInfoData[selectedPosition.marketAddress].longToken.prices,
-      isIncrease: false,
-      isLong: selectedPosition.isLong,
+    await recreateOrSkipExistingStopLoss({
+      sdk,
+      marketsInfoData,
+      tokensData,
+      order: firstOrder,
+      position: selectedPosition,
     });
+    await sleep(STOP_LOSS_RECREATION_INTERVAL_MS);
 
-    const necessaryTriggerPrice = selectedPosition.isLong
-      ? bigMath.mulDiv(currentPrice, 90n, 100n)
-      : bigMath.mulDiv(currentPrice, 110n, 100n);
-
-    console.log(
-      "Necessary trigger price",
-      formatUnits(necessaryTriggerPrice, USD_DECIMALS)
-    );
-
-    if (
-      bigMath.abs(existingTriggerPrice - necessaryTriggerPrice) <
-      bigMath.mulDiv(currentPrice, 1_00n, 100_00n)
-    ) {
-      console.log(
-        "Trigger price is within 1% of necessary trigger price. Skipping..."
-      );
-      return;
-    }
-
-    const existingOrderKey = firstOrder.key;
-
-    // cancel the existing order
-
-    await Promise.all([
-      sdk.orders.cancelOrders([existingOrderKey]),
-      createNewStopLossOrder({
-        sdk,
-        marketsInfoData,
-        tokensData,
-        position: selectedPosition,
-      }),
-    ]);
+    loopRecreateOrSkipExistingStopLoss({ position: selectedPosition });
 
     return;
   }
