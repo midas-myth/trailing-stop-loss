@@ -10,9 +10,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { avalancheFuji } from "viem/chains";
 
-// SDK imports
-
 import { GmxSdk } from "@gmx-io/sdk";
+
 import { USD_DECIMALS } from "@gmx-io/sdk/configs/factors.js";
 import { MarketsInfoData } from "@gmx-io/sdk/types/markets.js";
 import {
@@ -29,6 +28,7 @@ import {
   getIsEquivalentTokens,
 } from "@gmx-io/sdk/utils/tokens.js";
 import { sleep } from "@gmx-io/sdk/utils/common.js";
+import { DecreasePositionAmounts } from "@gmx-io/sdk/types/trade.js";
 
 dotenv.config();
 
@@ -85,9 +85,35 @@ const sdk = new GmxSdk({
   walletClient: walletClient,
   publicClient: publicClient,
   subsquidUrl: "https://gmx.squids.live/gmx-synthetics-fuji:live/api/graphql",
-  subgraphUrl:
-    "https://subgraph.satsuma-prod.com/3b2ced13c8d9/gmx/synthetics-fuji-stats/api",
 });
+
+const USELESS_DECREASE_AMOUNTS = {
+  isFullClose: true,
+  indexPrice: 0n,
+  collateralPrice: 0n,
+  acceptablePriceDeltaBps: 0n,
+  recommendedAcceptablePriceDeltaBps: 0n,
+  estimatedPnl: 0n,
+  estimatedPnlPercentage: 0n,
+  realizedPnl: 0n,
+  realizedPnlPercentage: 0n,
+  positionFeeUsd: 0n,
+  uiFeeUsd: 0n,
+  swapUiFeeUsd: 0n,
+  feeDiscountUsd: 0n,
+  borrowingFeeUsd: 0n,
+  fundingFeeUsd: 0n,
+  swapProfitFeeUsd: 0n,
+  positionPriceImpactDeltaUsd: 0n,
+  priceImpactDiffUsd: 0n,
+  payedRemainingCollateralAmount: 0n,
+  payedOutputUsd: 0n,
+  payedRemainingCollateralUsd: 0n,
+  receiveTokenAmount: 0n,
+  receiveUsd: 0n,
+  decreaseSwapType: DecreasePositionSwapType.NoSwap,
+  triggerOrderType: OrderType.StopLossDecrease,
+} satisfies Partial<DecreasePositionAmounts>;
 
 async function createNewStopLossOrder({
   sdk,
@@ -131,67 +157,21 @@ async function createNewStopLossOrder({
     collateralPrice
   )!;
 
-  //   really needed fields
-
-  // swapPath: string[];
-  // receiveTokenAddress: string;
-  // sizeDeltaUsd: bigint;
-  // sizeDeltaInTokens: bigint;
-  // acceptablePrice: bigint;
-  // triggerPrice: bigint | undefined;
-  // minOutputUsd: bigint;
-  // isLong: boolean;
-  // decreasePositionSwapType: DecreasePositionSwapType;
-  // orderType: OrderType.MarketDecrease | OrderType.LimitDecrease | OrderType.StopLossDecrease;
-  // executionFee: bigint;
-  // allowedSlippage: number;
-  // skipSimulation?: boolean;
-  // referralCode?: string;
-  // indexToken: Token;
-  // tokensData: TokensData;
-  // autoCancel: boolean;
-
-  // const stopLossOrder = await
-
   console.log("Creating stop loss order. Creating...");
+
   await sdk.orders.createDecreaseOrder({
     allowedSlippage: 50,
     collateralToken: tokensData[position.collateralTokenAddress],
     marketInfo,
     marketsInfoData,
     decreaseAmounts: {
-      isFullClose: true,
+      ...USELESS_DECREASE_AMOUNTS,
       sizeDeltaUsd: position.sizeInUsd,
       sizeDeltaInTokens: position.sizeInTokens,
       collateralDeltaUsd: estimatedCollateralUsd,
       collateralDeltaAmount: position.collateralAmount,
-      indexPrice: 0n,
-      collateralPrice: 0n,
       triggerPrice: stopLossPrice,
       acceptablePrice: stopLossPrice,
-      acceptablePriceDeltaBps: 0n,
-      recommendedAcceptablePriceDeltaBps: 0n,
-      estimatedPnl: 0n,
-      estimatedPnlPercentage: 0n,
-      realizedPnl: 0n,
-      realizedPnlPercentage: 0n,
-      positionFeeUsd: 0n,
-      uiFeeUsd: 0n,
-      swapUiFeeUsd: 0n,
-      feeDiscountUsd: 0n,
-      borrowingFeeUsd: 0n,
-      fundingFeeUsd: 0n,
-      swapProfitFeeUsd: 0n,
-      positionPriceImpactDeltaUsd: 0n,
-      priceImpactDiffUsd: 0n,
-      payedRemainingCollateralAmount: 0n,
-      payedOutputUsd: 0n,
-      payedRemainingCollateralUsd: 0n,
-      receiveTokenAmount: 0n,
-      receiveUsd: 0n,
-      decreaseSwapType: DecreasePositionSwapType.NoSwap,
-      triggerOrderType: OrderType.StopLossDecrease,
-      // triggerThresholdType
     },
     isLong: position.isLong,
     tokensData,
@@ -309,7 +289,7 @@ async function loopRecreateOrSkipExistingStopLoss({
     // check if position is still open
 
     const positions = await sdk.positions.getPositions({
-      marketsInfoData,
+      marketsData: marketsInfoData,
       tokensData,
     });
 
@@ -353,7 +333,7 @@ async function main() {
   if (!marketsInfoData || !tokensData) return;
 
   const positions = await sdk.positions.getPositions({
-    marketsInfoData: marketsInfoData,
+    marketsData: marketsInfoData,
     tokensData: tokensData,
   });
 
@@ -433,16 +413,20 @@ async function main() {
     loopRecreateOrSkipExistingStopLoss({ position: selectedPosition });
 
     return;
+  } else {
+    // create a stop loss when price is 10% different from the current price. lower for long, higher for short.
+
+    createNewStopLossOrder({
+      sdk,
+      marketsInfoData,
+      tokensData,
+      position: selectedPosition,
+    });
+
+    await sleep(STOP_LOSS_RECREATION_INTERVAL_MS);
+
+    loopRecreateOrSkipExistingStopLoss({ position: selectedPosition });
   }
-
-  // create a stop loss when price is 10% different from the current price. lower for long, higher for short.
-
-  createNewStopLossOrder({
-    sdk,
-    marketsInfoData,
-    tokensData,
-    position: selectedPosition,
-  });
 }
 
 main();
